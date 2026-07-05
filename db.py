@@ -28,6 +28,7 @@ _db = _client[DB_NAME]
 
 channels_col = _db["channels"]
 settings_col = _db["settings"]
+file_hashes_col = _db["file_hashes"]
 
 
 async def add_channel(channel_id: int, title: str, start_message_id: int) -> bool:
@@ -72,4 +73,26 @@ async def update_last_message_id(channel_id: int, message_id: int):
 async def set_in_progress(channel_id: int, value: bool):
     await channels_col.update_one(
         {"_id": channel_id}, {"$set": {"in_progress": value}}
+    )
+
+
+async def is_duplicate_file(file_key: str) -> bool:
+    """file_key = Telegram's document id (as string). Telegram dedups
+    identical uploaded file content to the same document id, so this
+    works as a lightweight 'file hash' without downloading the video."""
+    doc = await file_hashes_col.find_one({"_id": file_key})
+    return doc is not None
+
+
+async def save_file_hash(file_key: str, source_channel_id: int, message_id: int):
+    await file_hashes_col.update_one(
+        {"_id": file_key},
+        {
+            "$setOnInsert": {
+                "source_channel_id": source_channel_id,
+                "message_id": message_id,
+                "added_at": datetime.datetime.utcnow(),
+            }
+        },
+        upsert=True,
     )
