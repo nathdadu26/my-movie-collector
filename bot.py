@@ -68,12 +68,30 @@ bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
 # in-memory guard so the same channel is never processed twice at once
 _locks = {}
+# tracks currently running copy tasks: channel_id -> asyncio.Task, so /cancel
+# can find and cancel them
+_running_tasks = {}
 
 
 def get_lock(channel_id: int) -> asyncio.Lock:
     if channel_id not in _locks:
         _locks[channel_id] = asyncio.Lock()
     return _locks[channel_id]
+
+
+def start_channel_task(channel_doc: dict, progress_chat_id: int) -> asyncio.Task:
+    """Creates and tracks a background copy task for a channel so it can
+    later be found and cancelled via /cancel."""
+    channel_id = channel_doc["_id"]
+    task = asyncio.create_task(process_channel(channel_doc, progress_chat_id))
+    _running_tasks[channel_id] = task
+
+    def _cleanup(t, cid=channel_id):
+        if _running_tasks.get(cid) is t:
+            del _running_tasks[cid]
+
+    task.add_done_callback(_cleanup)
+    return task
 
 
 def is_owner(event) -> bool:
@@ -190,6 +208,20 @@ async def process_channel(channel_doc: dict, progress_chat_id: int):
             except Exception:
                 await bot_client.send_message(progress_chat_id, final_text)
 
+        except asyncio.CancelledError:
+            cancel_text = (
+                build_progress_text(title, start_id, copied, failed, skipped, duplicate)
+                + "\n\n🛑 Cancelled by user"
+            )
+            try:
+                if progress_msg:
+                    await bot_client.edit_message(progress_chat_id, progress_msg, cancel_text)
+                else:
+                    await bot_client.send_message(progress_chat_id, cancel_text)
+            except Exception:
+                pass
+            raise
+
         finally:
             await db.set_in_progress(channel_id, False)
 
@@ -225,14 +257,18 @@ async def _copy_one(message, target_entity) -> bool:
 
 
 async def daily_revisit():
-    """Triggered every day at midnight: re-checks every tracked channel."""
+    """Triggered every day at midnight: re-checks every tracked channel,
+    one at a time (still cancellable via /cancel while it runs)."""
     logger.info("Running scheduled daily revisit of all channels...")
     channels = await db.get_all_channels()
     for ch in channels:
         if ch.get("in_progress"):
             continue
         try:
-            await process_channel(ch, OWNER_ID)
+            task = start_channel_task(ch, OWNER_ID)
+            await task
+        except asyncio.CancelledError:
+            logger.info("Processing for channel %s was cancelled.", ch.get("_id"))
         except Exception as e:
             logger.error("Daily revisit failed for %s: %s", ch.get("_id"), e)
 
@@ -249,7 +285,8 @@ async def start_handler(event):
         "**Commands:**\n"
         "`/start` - ye help message\n"
         "`/all_channels` - sabhi tracked source channels ki list (name + id)\n"
-        "`/remove_channel <channel_id>` - channel ko tracking se hata do\n\n"
+        "`/remove_channel <channel_id>` - channel ko tracking se hata do\n"
+        "`/cancel [channel_id]` - running copy process rok do (id na do to sabhi cancel)\n\n"
         "**Kaise use karein:**\n"
         "1️⃣ Target channel already `.env` me `TARGET_CHANNEL_ID` se set hai "
         "(is bot ka user account us channel me member/admin hona chahiye).\n"
@@ -268,7 +305,9 @@ async def start_handler(event):
         "8️⃣ Forward kiya hua message channel-id/message-id nikalne ke baad "
         "khud delete ho jata hai.\n"
         "9️⃣ Duplicate videos (already copied) skip ho jati hain, file-hash "
-        "check se."
+        "check se.\n"
+        "🔟 Agar bot restart/crash ho jaye to jo process beech me chal raha "
+        "tha wo automatically resume ho jayega."
     )
     await event.respond(text)
 
@@ -302,7 +341,44 @@ async def remove_channel_handler(event):
         await event.respond("❌ Invalid channel id.")
         return
     removed = await db.remove_channel(cid)
+    if removed:
+        task = _running_tasks.get(cid)
+        if task:
+            task.cancel()
     await event.respond("✅ Channel removed." if removed else "❌ Ye channel id mili nahi.")
+
+
+@bot_client.on(events.NewMessage(pattern="/cancel"))
+async def cancel_handler(event):
+    if not is_owner(event):
+        return
+    parts = event.raw_text.split()
+
+    if len(parts) == 1:
+        # no channel id given -> cancel everything currently running
+        if not _running_tasks:
+            await event.respond("Koi running process nahi hai.")
+            return
+        count = 0
+        for cid, task in list(_running_tasks.items()):
+            task.cancel()
+            count += 1
+        await event.respond(f"🛑 {count} running process(es) cancel kiye ja rahe hain...")
+        return
+
+    try:
+        cid = int(parts[1])
+    except ValueError:
+        await event.respond("Usage: `/cancel` (sabhi) ya `/cancel <channel_id>`")
+        return
+
+    task = _running_tasks.get(cid)
+    if not task:
+        await event.respond("Ye channel abhi process nahi ho raha.")
+        return
+
+    task.cancel()
+    await event.respond("🛑 Process cancel kiya ja raha hai...")
 
 
 @bot_client.on(events.NewMessage(func=lambda e: e.message.fwd_from is not None))
@@ -352,7 +428,7 @@ async def forward_handler(event):
     await db.add_channel(channel_id, title, message_id)
 
     channel_doc = await db.get_channel(channel_id)
-    asyncio.create_task(process_channel(channel_doc, event.chat_id))
+    start_channel_task(channel_doc, event.chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +505,24 @@ async def main():
             "Could not access TARGET_CHANNEL_ID (%s). Make sure the user "
             "account is a member/admin there. Error: %s", TARGET_CHANNEL_ID, e,
         )
+
+    # Auto-resume: if the bot restarted/crashed mid-copy, any channel still
+    # marked in_progress in the DB gets its copying restarted automatically
+    # (it picks up right after the last saved message id, not from scratch).
+    try:
+        all_channels = await db.get_all_channels()
+        interrupted = [c for c in all_channels if c.get("in_progress")]
+        for ch in interrupted:
+            logger.info("Resuming interrupted processing for channel %s", ch["_id"])
+            start_channel_task(ch, OWNER_ID)
+        if interrupted:
+            await bot_client.send_message(
+                OWNER_ID,
+                f"🔄 Restart ke baad {len(interrupted)} channel(s) ki copying "
+                f"automatically resume ho rahi hai.",
+            )
+    except Exception as e:
+        logger.error("Auto-resume check failed: %s", e)
 
     await start_health_server()
     asyncio.create_task(self_ping_loop())
