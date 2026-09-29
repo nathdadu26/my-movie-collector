@@ -73,6 +73,19 @@ def is_owner(event) -> bool:
     return event.sender_id == OWNER_ID
 
 
+async def ensure_user_connected():
+    """Ensures user_client is connected; attempts reconnection if dropped."""
+    if not user_client.is_connected():
+        logger.warning("user_client disconnected. Attempting reconnection...")
+        try:
+            await user_client.connect()
+            if not await user_client.is_user_authorized():
+                await user_client.start()
+            logger.info("user_client reconnected successfully.")
+        except Exception as e:
+            logger.error("Failed to reconnect user_client: %s", e)
+
+
 def parse_telegram_link(link: str):
     """
     Parses public and private Telegram message links.
@@ -86,7 +99,6 @@ def parse_telegram_link(link: str):
     priv_match = re.search(private_pattern, link)
     if priv_match:
         raw_id = priv_match.group(1)
-        # Convert internal telegram private channel id to standard bot peer format
         cid = int(f"-100{raw_id}") if not raw_id.startswith("-100") else int(raw_id)
         msg_id = int(priv_match.group(2))
         return cid, msg_id
@@ -117,7 +129,7 @@ def build_progress_text(channel_title, start_id, copied, failed, skipped, duplic
     text = (
         f"📊 **Copying Progress**\n"
         f"📌 **Channel:** {channel_title}\n"
-        f"🆔 **Starting Msg ID:** {start_id}\n\n"
+        f"🆔 **Start Msg ID:** {start_id}\n\n"
         f"✅ Copied: {copied}\n"
         f"❌ Failed: {failed}\n"
         f"⏩ Skipped: {skipped}\n"
@@ -132,6 +144,7 @@ def build_progress_text(channel_title, start_id, copied, failed, skipped, duplic
 # Core Copy Logic
 # ---------------------------------------------------------------------------
 async def _copy_one(message, target_entity) -> bool:
+    await ensure_user_connected()
     try:
         await user_client.send_file(
             target_entity,
@@ -153,6 +166,21 @@ async def _copy_one(message, target_entity) -> bool:
             return True
         except Exception as e2:
             logger.error("Retry failed for msg %s: %s", message.id, e2)
+            return False
+    except (ConnectionError, OSError) as e:
+        logger.warning("Connection lost on copy for msg %s: %s. Retrying...", message.id, e)
+        await asyncio.sleep(3)
+        await ensure_user_connected()
+        try:
+            await user_client.send_file(
+                target_entity,
+                file=message.media,
+                caption=message.message or "",
+                formatting_entities=message.entities,
+            )
+            return True
+        except Exception as e3:
+            logger.error("Retry after reconnect failed for msg %s: %s", message.id, e3)
             return False
     except Exception as e:
         logger.error("Copy failed for msg %s: %s", message.id, e)
@@ -177,13 +205,14 @@ async def process_channel_copy(channel_id: int, start_msg_id: int, progress_chat
         progress_msg = None
 
         try:
+            await ensure_user_connected()
             source_entity = await user_client.get_entity(channel_id)
             target_entity = await user_client.get_entity(TARGET_CHANNEL_ID)
             title = getattr(source_entity, "title", str(channel_id))
         except Exception as e:
             await bot_client.send_message(
                 progress_chat_id,
-                f"❌ Channel access fail! (User account member hai checkout karo): {e}",
+                f"❌ Channel access fail: {e}",
             )
             await db.set_in_progress(channel_id, False)
             return
@@ -195,38 +224,45 @@ async def process_channel_copy(channel_id: int, start_msg_id: int, progress_chat
 
         last_scanned_id = start_msg_id - 1
         try:
-            # Iterates sequentially reverse=True (from oldest start_msg_id to newest)
-            async for message in user_client.iter_messages(
-                source_entity, min_id=start_msg_id - 1, reverse=True
-            ):
-                if is_qualifying_video(message):
-                    file_key = get_file_key(message)
-                    if file_key and await db.is_duplicate_file(file_key):
-                        duplicate += 1
-                    else:
-                        success = await _copy_one(message, target_entity)
-                        if success:
-                            copied += 1
-                            if file_key:
-                                await db.save_file_hash(file_key, channel_id, message.id)
-                            await asyncio.sleep(COPY_GAP_SECONDS)
+            while True:
+                try:
+                    await ensure_user_connected()
+                    async for message in user_client.iter_messages(
+                        source_entity, min_id=last_scanned_id, reverse=True
+                    ):
+                        if is_qualifying_video(message):
+                            file_key = get_file_key(message)
+                            if file_key and await db.is_duplicate_file(file_key):
+                                duplicate += 1
+                            else:
+                                success = await _copy_one(message, target_entity)
+                                if success:
+                                    copied += 1
+                                    if file_key:
+                                        await db.save_file_hash(file_key, channel_id, message.id)
+                                    await asyncio.sleep(COPY_GAP_SECONDS)
+                                else:
+                                    failed += 1
                         else:
-                            failed += 1
-                else:
-                    skipped += 1
+                            skipped += 1
 
-                last_scanned_id = message.id
-                await db.update_last_message_id(channel_id, last_scanned_id)
+                        last_scanned_id = message.id
+                        await db.update_last_message_id(channel_id, last_scanned_id)
 
-                if (copied + failed + skipped + duplicate) % PROGRESS_EVERY == 0:
-                    try:
-                        await bot_client.edit_message(
-                            progress_chat_id,
-                            progress_msg,
-                            build_progress_text(title, start_msg_id, copied, failed, skipped, duplicate),
-                        )
-                    except Exception:
-                        pass
+                        if (copied + failed + skipped + duplicate) % PROGRESS_EVERY == 0:
+                            try:
+                                await bot_client.edit_message(
+                                    progress_chat_id,
+                                    progress_msg,
+                                    build_progress_text(title, start_msg_id, copied, failed, skipped, duplicate),
+                                )
+                            except Exception:
+                                pass
+                    break
+                except (ConnectionError, OSError) as conn_err:
+                    logger.warning("Disconnected inside iter_messages loop: %s. Reconnecting...", conn_err)
+                    await asyncio.sleep(5)
+                    await ensure_user_connected()
 
             final_text = build_progress_text(
                 title, start_msg_id, copied, failed, skipped, duplicate, finished=True
@@ -257,7 +293,7 @@ async def process_channel_copy(channel_id: int, start_msg_id: int, progress_chat
 # ---------------------------------------------------------------------------
 @user_client.on(events.NewMessage)
 async def live_channel_monitor(event):
-    """Monitors live incoming posts in /add_channel registered channels."""
+    """Monitors live incoming posts in registered channels."""
     channel_id = event.chat_id
     if not channel_id:
         return
@@ -269,7 +305,6 @@ async def live_channel_monitor(event):
         return
 
     message = event.message
-    # Check if the message comes after saved last_message_id
     if message.id <= channel_doc.get("last_message_id", 0):
         return
 
@@ -284,6 +319,7 @@ async def live_channel_monitor(event):
 
             logger.info("Realtime: Copying new video from %s (msg %s)", channel_id, message.id)
             try:
+                await ensure_user_connected()
                 target_entity = await user_client.get_entity(TARGET_CHANNEL_ID)
                 success = await _copy_one(message, target_entity)
                 if success:
@@ -334,6 +370,22 @@ async def daily_revisit():
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+@bot_client.on(events.NewMessage(pattern=r"^/start$"))
+async def start_handler(event):
+    if not is_owner(event):
+        return
+    text = (
+        "🤖 **Video Copy & Monitor Bot**\n\n"
+        "📌 **Commands:**\n"
+        "• `/add_channel <link>` - Track & monitor new channel\n"
+        "• `/copy <link>` - Copy channel videos from link message ID\n"
+        "• `/all_channels` - View tracked channels list\n"
+        "• `/remove_channel <id>` - Remove channel tracking\n"
+        "• `/cancel` - Stop ongoing tasks"
+    )
+    await event.respond(text)
+
+
 @bot_client.on(events.NewMessage(pattern=r"^/add_channel(?:\s+(.+))?"))
 async def add_channel_handler(event):
     if not is_owner(event):
@@ -341,30 +393,29 @@ async def add_channel_handler(event):
 
     link = event.pattern_match.group(1)
     if not link:
-        await event.respond("❌ **Usage:** `/add_channel <message_link>`\nExample: `/add_channel https://t.me/c/3888815428/843`")
+        await event.respond("❌ Usage: `/add_channel <message_link>`")
         return
 
     target_channel, msg_id = parse_telegram_link(link)
     if not target_channel or not msg_id:
-        await event.respond("❌ Invalid Message Link format.")
+        await event.respond("❌ Invalid Telegram message link.")
         return
 
     try:
+        await ensure_user_connected()
         entity = await user_client.get_entity(target_channel)
         channel_id = utils.get_peer_id(entity)
         title = getattr(entity, "title", str(channel_id))
     except Exception as e:
-        await event.respond(f"❌ Channel access error (ensure user account is member): {e}")
+        await event.respond(f"❌ Access error: {e}")
         return
 
-    # Store channel and set base message_id
     await db.add_channel(channel_id, title, msg_id)
     await event.respond(
-        f"✅ **Channel Registered Successfully!**\n\n"
+        f"✅ **Channel Registered!**\n\n"
         f"📌 **Title:** {title}\n"
         f"🆔 **Channel ID:** `{channel_id}`\n"
-        f"🔢 **Start Msg ID:** `{msg_id}`\n\n"
-        f"Is message ID se aage realtime post monitor honge aur daily 24h scan runs honge."
+        f"🔢 **Start Msg ID:** `{msg_id}`"
     )
 
 
@@ -375,22 +426,23 @@ async def copy_handler(event):
 
     link = event.pattern_match.group(1)
     if not link:
-        await event.respond("❌ **Usage:** `/copy <message_link>`\nExample: `/copy https://t.me/c/3888815428/843`")
+        await event.respond("❌ Usage: `/copy <message_link>`")
         return
 
     target_channel, msg_id = parse_telegram_link(link)
     if not target_channel or not msg_id:
-        await event.respond("❌ Invalid Message Link format.")
+        await event.respond("❌ Invalid Telegram message link.")
         return
 
     try:
+        await ensure_user_connected()
         entity = await user_client.get_entity(target_channel)
         channel_id = utils.get_peer_id(entity)
     except Exception as e:
-        await event.respond(f"❌ Channel access error: {e}")
+        await event.respond(f"❌ Access error: {e}")
         return
 
-    await event.respond(f"🚀 **Copy Process Started** from Msg ID `{msg_id}`...")
+    await event.respond(f"🚀 **Copying Started** from Msg ID `{msg_id}`...")
     
     task = asyncio.create_task(process_channel_copy(channel_id, msg_id, event.chat_id))
     _running_tasks[channel_id] = task
@@ -408,7 +460,7 @@ async def all_channels_handler(event):
         return
     channels = await db.get_all_channels()
     if not channels:
-        await event.respond("Abhi koi channel track nahi ho raha.")
+        await event.respond("Koi channel track nahi ho raha.")
         return
     lines = [
         f"• **{c.get('title', 'Unknown')}** — `{c['_id']}` (last_id: `{c.get('last_message_id')}`)"
@@ -428,14 +480,14 @@ async def remove_channel_handler(event):
     try:
         cid = int(parts[1])
     except ValueError:
-        await event.respond("❌ Invalid channel id.")
+        await event.respond("❌ Invalid channel ID.")
         return
     removed = await db.remove_channel(cid)
     if removed:
         task = _running_tasks.get(cid)
         if task:
             task.cancel()
-    await event.respond("✅ Channel removed." if removed else "❌ Ye channel id mili nahi.")
+    await event.respond("✅ Channel removed." if removed else "❌ Channel ID nahi mili.")
 
 
 @bot_client.on(events.NewMessage(pattern="/cancel"))
@@ -463,30 +515,11 @@ async def cancel_handler(event):
 
     task = _running_tasks.get(cid)
     if not task:
-        await event.respond("Is channel ka koi task abhi nahi chal raha.")
+        await event.respond("Is channel ka koi task active nahi hai.")
         return
 
     task.cancel()
     await event.respond("🛑 Process cancel kiya gaya.")
-
-
-@bot_client.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
-    if not is_owner(event):
-        return
-    text = (
-        "🎬 **Video Copy & Channel Monitoring Bot**\n\n"
-        "**Commands:**\n"
-        "• `/add_channel <link>` - Channel register karein (Link ke Msg ID se monitoring start hogi)\n"
-        "• `/copy <link>` - Link waale Message ID se aage ka content target channel me copy karein\n"
-        "• `/all_channels` - Tracked channels ki list dikhayen\n"
-        "• `/remove_channel <channel_id>` - Channel tracking se hatayein\n"
-        "• `/cancel` - Active background task cancel karein\n\n"
-        "**Features:**\n"
-        "1. `/add_channel` waale saare channels real-time monitor honge.\n"
-        "2. Har 24 ghante me sabhi channels **ek-ek karke (sequentially)** scan honge."
-    )
-    await event.respond(text)
 
 
 # ---------------------------------------------------------------------------
