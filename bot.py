@@ -1,29 +1,24 @@
 """
-bot.py - Telegram multi-feature video copy bot.
+bot.py - Telegram multi-feature video copy & channel monitoring bot.
 
-Two Telethon clients are used:
-  user_client  -> logged in via SESSION_STRING (a real user account).
-                  Used to read message history from source channels and to
-                  copy ("send by file reference", no download needed) videos
-                  into the target channel. This account must be a MEMBER
-                  (or admin, for the target channel) of every channel involved.
-  bot_client   -> logged in via BOT_TOKEN.
-                  Used only to talk to the owner: commands + progress updates.
+Two Telethon clients:
+  user_client  -> logged in via SESSION_STRING (Real user account, member of target & source channels)
+  bot_client   -> logged in via BOT_TOKEN (Owner commands and updates)
 
-Flow:
-  1. Target channel is fixed via the TARGET_CHANNEL_ID env variable.
-  2. Owner forwards any message from a source channel to this bot.
-  3. Bot registers that channel (starting at the forwarded message's id) and
-     immediately starts copying all qualifying videos (size > 10MB) from that
-     point onward, in order, skipping every other media type.
-  4. Every day at 00:00 (Asia/Kolkata by default) the bot automatically
-     re-checks all registered channels for new messages and copies any new
-     qualifying videos the same way.
-  5. Progress is posted to the owner every 10 processed messages, and there
-     is a 10 second gap after every successfully copied file.
+Features & Workflows:
+  1. /add_channel <message_link>
+     - Extract channel_id & start message_id.
+     - Saves channel into database for live monitoring & 24h cron scan.
+  2. /copy <message_link>
+     - Instant copying task from the given message_id up to the latest post.
+  3. Real-Time Monitor
+     - Monitors only /add_channel registered channels in real-time.
+  4. Daily 24h Scan
+     - Sequentially processes channels one-by-one starting strictly after the saved message_id.
 """
 
 import os
+import re
 import asyncio
 import logging
 import signal
@@ -44,8 +39,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("bot")
-# Telethon logs a lot of harmless INFO noise (reconnects, "got difference for
-# updates" after catching up on missed events, etc.) - keep only warnings+.
 logging.getLogger("telethon").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
@@ -66,10 +59,7 @@ PROGRESS_EVERY = 10
 user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
-# in-memory guard so the same channel is never processed twice at once
 _locks = {}
-# tracks currently running copy tasks: channel_id -> asyncio.Task, so /cancel
-# can find and cancel them
 _running_tasks = {}
 
 
@@ -79,156 +69,69 @@ def get_lock(channel_id: int) -> asyncio.Lock:
     return _locks[channel_id]
 
 
-def start_channel_task(channel_doc: dict, progress_chat_id: int) -> asyncio.Task:
-    """Creates and tracks a background copy task for a channel so it can
-    later be found and cancelled via /cancel."""
-    channel_id = channel_doc["_id"]
-    task = asyncio.create_task(process_channel(channel_doc, progress_chat_id))
-    _running_tasks[channel_id] = task
-
-    def _cleanup(t, cid=channel_id):
-        if _running_tasks.get(cid) is t:
-            del _running_tasks[cid]
-
-    task.add_done_callback(_cleanup)
-    return task
-
-
 def is_owner(event) -> bool:
     return event.sender_id == OWNER_ID
 
 
+def parse_telegram_link(link: str):
+    """
+    Parses public and private Telegram message links.
+    Examples:
+      - Private: https://t.me/c/3888815428/843  -> (-1003888815428, 843)
+      - Public:  https://t.me/channelname/843    -> ('channelname', 843)
+    """
+    private_pattern = r"t\.me/c/(\d+)/(\d+)"
+    public_pattern = r"t\.me/([^/]+)/(\d+)"
+
+    priv_match = re.search(private_pattern, link)
+    if priv_match:
+        raw_id = priv_match.group(1)
+        # Convert internal telegram private channel id to standard bot peer format
+        cid = int(f"-100{raw_id}") if not raw_id.startswith("-100") else int(raw_id)
+        msg_id = int(priv_match.group(2))
+        return cid, msg_id
+
+    pub_match = re.search(public_pattern, link)
+    if pub_match:
+        username = pub_match.group(1)
+        msg_id = int(pub_match.group(2))
+        return username, msg_id
+
+    return None, None
+
+
 def is_qualifying_video(message) -> bool:
-    """Only real video files over 10MB qualify. Everything else is skipped."""
-    if not message.video:
+    if not message or not message.video:
         return False
     size = message.file.size if message.file else 0
     return size > VIDEO_SIZE_LIMIT_BYTES
 
 
 def get_file_key(message):
-    """Telegram's own document id uniquely identifies identical file content
-    (Telegram dedups uploads server-side), so we use it as a lightweight
-    'file hash' for duplicate detection without downloading the video."""
-    if message.document:
+    if message and message.document:
         return str(message.document.id)
     return None
 
 
 def build_progress_text(channel_title, start_id, copied, failed, skipped, duplicate, finished=False):
     text = (
-        f"Copying Started From {channel_title}\n"
-        f"Starting Message ID : {start_id}\n"
-        f"Total Copied : {copied}\n"
-        f"Failed : {failed}\n"
-        f"Skipped : {skipped}\n"
-        f"Duplicate : {duplicate}"
+        f"📊 **Copying Progress**\n"
+        f"📌 **Channel:** {channel_title}\n"
+        f"🆔 **Starting Msg ID:** {start_id}\n\n"
+        f"✅ Copied: {copied}\n"
+        f"❌ Failed: {failed}\n"
+        f"⏩ Skipped: {skipped}\n"
+        f"♻️ Duplicate: {duplicate}"
     )
     if finished:
-        text += "\n\n🏁 Finished"
+        text += "\n\n🏁 **Process Finished!**"
     return text
 
 
 # ---------------------------------------------------------------------------
-# Core copy logic
+# Core Copy Logic
 # ---------------------------------------------------------------------------
-async def process_channel(channel_doc: dict, progress_chat_id: int):
-    """Copies all qualifying videos from a channel, starting right after
-    its stored last_message_id, up to the newest message. Posts ONE
-    progress message that gets edited every 10 successful copies."""
-    channel_id = channel_doc["_id"]
-    title = channel_doc.get("title", str(channel_id))
-    lock = get_lock(channel_id)
-
-    if lock.locked():
-        logger.info("Channel %s already being processed, skipping trigger.", channel_id)
-        return
-
-    async with lock:
-        target_id = TARGET_CHANNEL_ID
-
-        fresh = await db.get_channel(channel_id)
-        last_id = fresh.get("last_message_id", 0) if fresh else channel_doc.get("last_message_id", 0)
-        start_id = last_id + 1
-
-        await db.set_in_progress(channel_id, True)
-        copied = failed = skipped = duplicate = 0
-        progress_msg = None
-
-        try:
-            try:
-                source_entity = await user_client.get_entity(channel_id)
-                target_entity = await user_client.get_entity(target_id)
-            except Exception as e:
-                await bot_client.send_message(
-                    progress_chat_id,
-                    f"❌ '{title}' access nahi ho paya (user account member hai check karo): {e}",
-                )
-                return
-
-            progress_msg = await bot_client.send_message(
-                progress_chat_id,
-                build_progress_text(title, start_id, copied, failed, skipped, duplicate),
-            )
-
-            async for message in user_client.iter_messages(
-                source_entity, min_id=last_id, reverse=True
-            ):
-                if is_qualifying_video(message):
-                    file_key = get_file_key(message)
-                    if file_key and await db.is_duplicate_file(file_key):
-                        duplicate += 1
-                    else:
-                        success = await _copy_one(message, target_entity)
-                        if success:
-                            copied += 1
-                            if file_key:
-                                await db.save_file_hash(file_key, channel_id, message.id)
-                            await asyncio.sleep(COPY_GAP_SECONDS)
-                        else:
-                            failed += 1
-                else:
-                    skipped += 1
-
-                last_id = message.id
-                await db.update_last_message_id(channel_id, last_id)
-
-                if copied > 0 and copied % PROGRESS_EVERY == 0:
-                    text = build_progress_text(title, start_id, copied, failed, skipped, duplicate)
-                    try:
-                        await bot_client.edit_message(progress_chat_id, progress_msg, text)
-                    except Exception as e:
-                        logger.warning("Progress edit failed: %s", e)
-
-            final_text = build_progress_text(
-                title, start_id, copied, failed, skipped, duplicate, finished=True
-            )
-            try:
-                await bot_client.edit_message(progress_chat_id, progress_msg, final_text)
-            except Exception:
-                await bot_client.send_message(progress_chat_id, final_text)
-
-        except asyncio.CancelledError:
-            cancel_text = (
-                build_progress_text(title, start_id, copied, failed, skipped, duplicate)
-                + "\n\n🛑 Cancelled by user"
-            )
-            try:
-                if progress_msg:
-                    await bot_client.edit_message(progress_chat_id, progress_msg, cancel_text)
-                else:
-                    await bot_client.send_message(progress_chat_id, cancel_text)
-            except Exception:
-                pass
-            raise
-
-        finally:
-            await db.set_in_progress(channel_id, False)
-
-
 async def _copy_one(message, target_entity) -> bool:
-    """Copies a single video message to target, preserving caption exactly.
-    Uses the existing file reference (no download) for speed."""
     try:
         await user_client.send_file(
             target_entity,
@@ -249,67 +152,254 @@ async def _copy_one(message, target_entity) -> bool:
             )
             return True
         except Exception as e2:
-            logger.error("Retry after FloodWait failed for msg %s: %s", message.id, e2)
+            logger.error("Retry failed for msg %s: %s", message.id, e2)
             return False
     except Exception as e:
         logger.error("Copy failed for msg %s: %s", message.id, e)
         return False
 
 
+async def process_channel_copy(channel_id: int, start_msg_id: int, progress_chat_id: int):
+    """
+    Copies qualifying videos sequentially from start_msg_id onwards to latest message.
+    Used by /copy and daily automatic revisit scan.
+    """
+    lock = get_lock(channel_id)
+
+    if lock.locked():
+        logger.info("Channel %s is currently locked/busy.", channel_id)
+        await bot_client.send_message(progress_chat_id, "⚠️ Is channel ka process pehle se chal raha hai.")
+        return
+
+    async with lock:
+        await db.set_in_progress(channel_id, True)
+        copied = failed = skipped = duplicate = 0
+        progress_msg = None
+
+        try:
+            source_entity = await user_client.get_entity(channel_id)
+            target_entity = await user_client.get_entity(TARGET_CHANNEL_ID)
+            title = getattr(source_entity, "title", str(channel_id))
+        except Exception as e:
+            await bot_client.send_message(
+                progress_chat_id,
+                f"❌ Channel access fail! (User account member hai checkout karo): {e}",
+            )
+            await db.set_in_progress(channel_id, False)
+            return
+
+        progress_msg = await bot_client.send_message(
+            progress_chat_id,
+            build_progress_text(title, start_msg_id, copied, failed, skipped, duplicate),
+        )
+
+        last_scanned_id = start_msg_id - 1
+        try:
+            # Iterates sequentially reverse=True (from oldest start_msg_id to newest)
+            async for message in user_client.iter_messages(
+                source_entity, min_id=start_msg_id - 1, reverse=True
+            ):
+                if is_qualifying_video(message):
+                    file_key = get_file_key(message)
+                    if file_key and await db.is_duplicate_file(file_key):
+                        duplicate += 1
+                    else:
+                        success = await _copy_one(message, target_entity)
+                        if success:
+                            copied += 1
+                            if file_key:
+                                await db.save_file_hash(file_key, channel_id, message.id)
+                            await asyncio.sleep(COPY_GAP_SECONDS)
+                        else:
+                            failed += 1
+                else:
+                    skipped += 1
+
+                last_scanned_id = message.id
+                await db.update_last_message_id(channel_id, last_scanned_id)
+
+                if (copied + failed + skipped + duplicate) % PROGRESS_EVERY == 0:
+                    try:
+                        await bot_client.edit_message(
+                            progress_chat_id,
+                            progress_msg,
+                            build_progress_text(title, start_msg_id, copied, failed, skipped, duplicate),
+                        )
+                    except Exception:
+                        pass
+
+            final_text = build_progress_text(
+                title, start_msg_id, copied, failed, skipped, duplicate, finished=True
+            )
+            try:
+                await bot_client.edit_message(progress_chat_id, progress_msg, final_text)
+            except Exception:
+                await bot_client.send_message(progress_chat_id, final_text)
+
+        except asyncio.CancelledError:
+            cancel_text = (
+                build_progress_text(title, start_msg_id, copied, failed, skipped, duplicate)
+                + "\n\n🛑 **Process Cancelled!**"
+            )
+            try:
+                if progress_msg:
+                    await bot_client.edit_message(progress_chat_id, progress_msg, cancel_text)
+            except Exception:
+                pass
+            raise
+
+        finally:
+            await db.set_in_progress(channel_id, False)
+
+
+# ---------------------------------------------------------------------------
+# Real-Time Monitoring
+# ---------------------------------------------------------------------------
+@user_client.on(events.NewMessage)
+async def live_channel_monitor(event):
+    """Monitors live incoming posts in /add_channel registered channels."""
+    channel_id = event.chat_id
+    if not channel_id:
+        return
+
+    tracked_channels = await db.get_all_channels()
+    channel_doc = next((c for c in tracked_channels if c["_id"] == channel_id), None)
+
+    if not channel_doc:
+        return
+
+    message = event.message
+    # Check if the message comes after saved last_message_id
+    if message.id <= channel_doc.get("last_message_id", 0):
+        return
+
+    lock = get_lock(channel_id)
+    async with lock:
+        if is_qualifying_video(message):
+            file_key = get_file_key(message)
+            if file_key and await db.is_duplicate_file(file_key):
+                logger.info("Realtime: Duplicate video skipped for %s (msg %s)", channel_id, message.id)
+                await db.update_last_message_id(channel_id, message.id)
+                return
+
+            logger.info("Realtime: Copying new video from %s (msg %s)", channel_id, message.id)
+            try:
+                target_entity = await user_client.get_entity(TARGET_CHANNEL_ID)
+                success = await _copy_one(message, target_entity)
+                if success:
+                    if file_key:
+                        await db.save_file_hash(file_key, channel_id, message.id)
+                    await db.update_last_message_id(channel_id, message.id)
+                    
+                    title = channel_doc.get("title", str(channel_id))
+                    await bot_client.send_message(
+                        OWNER_ID,
+                        f"⚡ **Live Video Copied!**\n📌 **Channel:** {title}\n🆔 **Msg ID:** `{message.id}`"
+                    )
+            except Exception as e:
+                logger.error("Live copy failed for channel %s: %s", channel_id, e)
+        else:
+            await db.update_last_message_id(channel_id, message.id)
+
+
+# ---------------------------------------------------------------------------
+# 24-Hour Sequential Cron Job
+# ---------------------------------------------------------------------------
 async def daily_revisit():
-    """Triggered every day at midnight: re-checks every tracked channel,
-    one at a time (still cancellable via /cancel while it runs)."""
-    logger.info("Running scheduled daily revisit of all channels...")
+    """Scans tracked channels one-by-one every 24 hours."""
+    logger.info("Starting daily 24-hour scan for all tracked channels sequentially...")
     channels = await db.get_all_channels()
+
     for ch in channels:
+        cid = ch["_id"]
         if ch.get("in_progress"):
             continue
+
+        last_id = ch.get("last_message_id", 0)
+        start_id = last_id + 1
+
         try:
-            task = start_channel_task(ch, OWNER_ID)
+            logger.info("Scanning channel %s from msg ID %s", cid, start_id)
+            task = asyncio.create_task(process_channel_copy(cid, start_id, OWNER_ID))
+            _running_tasks[cid] = task
             await task
         except asyncio.CancelledError:
-            logger.info("Processing for channel %s was cancelled.", ch.get("_id"))
+            logger.info("Daily scan cancelled for channel %s", cid)
         except Exception as e:
-            logger.error("Daily revisit failed for %s: %s", ch.get("_id"), e)
+            logger.error("Daily scan failed for channel %s: %s", cid, e)
+        finally:
+            _running_tasks.pop(cid, None)
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-@bot_client.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
+@bot_client.on(events.NewMessage(pattern=r"^/add_channel(?:\s+(.+))?"))
+async def add_channel_handler(event):
     if not is_owner(event):
         return
-    text = (
-        "🎬 **Video Copy Bot**\n\n"
-        "**Commands:**\n"
-        "`/start` - ye help message\n"
-        "`/all_channels` - sabhi tracked source channels ki list (name + id)\n"
-        "`/remove_channel <channel_id>` - channel ko tracking se hata do\n"
-        "`/cancel [channel_id]` - running copy process rok do (id na do to sabhi cancel)\n\n"
-        "**Kaise use karein:**\n"
-        "1️⃣ Target channel already `.env` me `TARGET_CHANNEL_ID` se set hai "
-        "(is bot ka user account us channel me member/admin hona chahiye).\n"
-        "2️⃣ Jis channel se video copy karni hai, wahan se jis message se "
-        "shuru karna hai, wo message seedha is bot ko **forward** kar do.\n"
-        "3️⃣ Bot khud us channel ko register kar lega aur us message id se "
-        "copying shuru kar dega.\n"
-        "4️⃣ Sirf **video files jinka size 10MB se zyada hai** copy hote hain; "
-        "image, gif, document, audio - sab skip.\n"
-        "5️⃣ Caption bilkul as-is rehta hai.\n"
-        "6️⃣ Har din raat 12:00 baje (IST) bot khud sabhi channels check "
-        "karega naye messages ke liye, aur automatically nayi videos copy "
-        "kar dega.\n"
-        "7️⃣ Har copy ke baad 10 second ka gap, aur har 10 successful copy "
-        "ke baad ek hi progress message update hota hai.\n"
-        "8️⃣ Forward kiya hua message channel-id/message-id nikalne ke baad "
-        "khud delete ho jata hai.\n"
-        "9️⃣ Duplicate videos (already copied) skip ho jati hain, file-hash "
-        "check se.\n"
-        "🔟 Agar bot restart/crash ho jaye to jo process beech me chal raha "
-        "tha wo automatically resume ho jayega."
+
+    link = event.pattern_match.group(1)
+    if not link:
+        await event.respond("❌ **Usage:** `/add_channel <message_link>`\nExample: `/add_channel https://t.me/c/3888815428/843`")
+        return
+
+    target_channel, msg_id = parse_telegram_link(link)
+    if not target_channel or not msg_id:
+        await event.respond("❌ Invalid Message Link format.")
+        return
+
+    try:
+        entity = await user_client.get_entity(target_channel)
+        channel_id = utils.get_peer_id(entity)
+        title = getattr(entity, "title", str(channel_id))
+    except Exception as e:
+        await event.respond(f"❌ Channel access error (ensure user account is member): {e}")
+        return
+
+    # Store channel and set base message_id
+    await db.add_channel(channel_id, title, msg_id)
+    await event.respond(
+        f"✅ **Channel Registered Successfully!**\n\n"
+        f"📌 **Title:** {title}\n"
+        f"🆔 **Channel ID:** `{channel_id}`\n"
+        f"🔢 **Start Msg ID:** `{msg_id}`\n\n"
+        f"Is message ID se aage realtime post monitor honge aur daily 24h scan runs honge."
     )
-    await event.respond(text)
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/copy(?:\s+(.+))?"))
+async def copy_handler(event):
+    if not is_owner(event):
+        return
+
+    link = event.pattern_match.group(1)
+    if not link:
+        await event.respond("❌ **Usage:** `/copy <message_link>`\nExample: `/copy https://t.me/c/3888815428/843`")
+        return
+
+    target_channel, msg_id = parse_telegram_link(link)
+    if not target_channel or not msg_id:
+        await event.respond("❌ Invalid Message Link format.")
+        return
+
+    try:
+        entity = await user_client.get_entity(target_channel)
+        channel_id = utils.get_peer_id(entity)
+    except Exception as e:
+        await event.respond(f"❌ Channel access error: {e}")
+        return
+
+    await event.respond(f"🚀 **Copy Process Started** from Msg ID `{msg_id}`...")
+    
+    task = asyncio.create_task(process_channel_copy(channel_id, msg_id, event.chat_id))
+    _running_tasks[channel_id] = task
+
+    def _cleanup(t):
+        if _running_tasks.get(channel_id) is t:
+            del _running_tasks[channel_id]
+
+    task.add_done_callback(_cleanup)
 
 
 @bot_client.on(events.NewMessage(pattern="/all_channels"))
@@ -321,13 +411,13 @@ async def all_channels_handler(event):
         await event.respond("Abhi koi channel track nahi ho raha.")
         return
     lines = [
-        f"• {c.get('title', 'Unknown')} — `{c['_id']}` (last_id: {c.get('last_message_id')})"
+        f"• **{c.get('title', 'Unknown')}** — `{c['_id']}` (last_id: `{c.get('last_message_id')}`)"
         for c in channels
     ]
     await event.respond("📋 **Tracked Channels:**\n\n" + "\n".join(lines))
 
 
-@bot_client.on(events.NewMessage(pattern="/remove_channel"))
+@bot_client.on(events.NewMessage(pattern=r"^/remove_channel(?:\s+(.+))?"))
 async def remove_channel_handler(event):
     if not is_owner(event):
         return
@@ -355,106 +445,60 @@ async def cancel_handler(event):
     parts = event.raw_text.split()
 
     if len(parts) == 1:
-        # no channel id given -> cancel everything currently running
         if not _running_tasks:
-            await event.respond("Koi running process nahi hai.")
+            await event.respond("Koi active running task nahi hai.")
             return
         count = 0
         for cid, task in list(_running_tasks.items()):
             task.cancel()
             count += 1
-        await event.respond(f"🛑 {count} running process(es) cancel kiye ja rahe hain...")
+        await event.respond(f"🛑 {count} task(s) cancel kiye ja rahe hain...")
         return
 
     try:
         cid = int(parts[1])
     except ValueError:
-        await event.respond("Usage: `/cancel` (sabhi) ya `/cancel <channel_id>`")
+        await event.respond("Usage: `/cancel` ya `/cancel <channel_id>`")
         return
 
     task = _running_tasks.get(cid)
     if not task:
-        await event.respond("Ye channel abhi process nahi ho raha.")
+        await event.respond("Is channel ka koi task abhi nahi chal raha.")
         return
 
     task.cancel()
-    await event.respond("🛑 Process cancel kiya ja raha hai...")
+    await event.respond("🛑 Process cancel kiya gaya.")
 
 
-@bot_client.on(events.NewMessage(func=lambda e: e.message.fwd_from is not None))
-async def forward_handler(event):
-    """Registers a new channel when the owner forwards a message from it."""
+@bot_client.on(events.NewMessage(pattern="/start"))
+async def start_handler(event):
     if not is_owner(event):
         return
-
-    fwd = event.message.fwd_from
-    if not fwd or fwd.channel_post is None or fwd.from_id is None:
-        await event.respond(
-            "⚠️ Ye forward kisi channel post jaisa nahi lag raha. "
-            "Kisi channel se directly message forward karo."
-        )
-        return
-
-    peer = fwd.from_id
-    if not isinstance(peer, types.PeerChannel):
-        await event.respond("⚠️ Sirf channel se forward kiya hua message support hai.")
-        return
-
-    channel_id = utils.get_peer_id(peer)  # normalizes to -100xxxxxxxxxx
-    message_id = fwd.channel_post
-
-    # We've extracted what we need (channel id + message id) from this
-    # forwarded message, so clean it up from the chat.
-    try:
-        await event.message.delete()
-    except Exception as e:
-        logger.warning("Could not delete forwarded message: %s", e)
-
-    existing = await db.get_channel(channel_id)
-    if existing:
-        await bot_client.send_message(event.chat_id, "ℹ️ Ye channel already tracked hai.")
-        return
-
-    try:
-        entity = await user_client.get_entity(channel_id)
-        title = getattr(entity, "title", str(channel_id))
-    except Exception as e:
-        await bot_client.send_message(
-            event.chat_id,
-            f"❌ User account (SESSION_STRING) is channel ka member nahi hai ya access nahi: {e}",
-        )
-        return
-
-    await db.add_channel(channel_id, title, message_id)
-
-    channel_doc = await db.get_channel(channel_id)
-    start_channel_task(channel_doc, event.chat_id)
+    text = (
+        "🎬 **Video Copy & Channel Monitoring Bot**\n\n"
+        "**Commands:**\n"
+        "• `/add_channel <link>` - Channel register karein (Link ke Msg ID se monitoring start hogi)\n"
+        "• `/copy <link>` - Link waale Message ID se aage ka content target channel me copy karein\n"
+        "• `/all_channels` - Tracked channels ki list dikhayen\n"
+        "• `/remove_channel <channel_id>` - Channel tracking se hatayein\n"
+        "• `/cancel` - Active background task cancel karein\n\n"
+        "**Features:**\n"
+        "1. `/add_channel` waale saare channels real-time monitor honge.\n"
+        "2. Har 24 ghante me sabhi channels **ek-ek karke (sequentially)** scan honge."
+    )
+    await event.respond(text)
 
 
 # ---------------------------------------------------------------------------
-# Startup
+# Startup & Shutdown
 # ---------------------------------------------------------------------------
 async def _connect_user_client():
-    """Connects the user client with a couple of retries. This helps with
-    transient network errors during platform redeploys/restarts."""
-    from telethon.errors import AuthKeyDuplicatedError
-
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
             await user_client.start()
-            logger.info("user_client (SESSION_STRING) started.")
+            logger.info("user_client started.")
             return
-        except AuthKeyDuplicatedError:
-            logger.error(
-                "AuthKeyDuplicatedError: is SESSION_STRING ka istemal ek se "
-                "zyada jagah/IP se ho raha hai (ya pichla instance cleanly "
-                "band nahi hua tha). Agar ye baar baar aa raha hai to naya "
-                "fresh SESSION_STRING generate karke .env update karo."
-            )
-            if attempt == attempts:
-                raise
-            await asyncio.sleep(5)
         except Exception as e:
             logger.warning("user_client start attempt %s/%s failed: %s", attempt, attempts, e)
             if attempt == attempts:
@@ -467,13 +511,10 @@ async def _shutdown():
     try:
         if user_client.is_connected():
             await user_client.disconnect()
-    except Exception as e:
-        logger.warning("Error disconnecting user_client: %s", e)
-    try:
         if bot_client.is_connected():
             await bot_client.disconnect()
     except Exception as e:
-        logger.warning("Error disconnecting bot_client: %s", e)
+        logger.warning("Shutdown error: %s", e)
 
 
 async def main():
@@ -481,7 +522,6 @@ async def main():
     stop_event = asyncio.Event()
 
     def _handle_signal():
-        logger.info("Shutdown signal received.")
         loop.create_task(_shutdown())
         stop_event.set()
 
@@ -489,40 +529,16 @@ async def main():
         try:
             loop.add_signal_handler(sig, _handle_signal)
         except NotImplementedError:
-            # add_signal_handler isn't available on some platforms (e.g. Windows)
             pass
 
     await _connect_user_client()
-
     await bot_client.start(bot_token=BOT_TOKEN)
-    logger.info("bot_client (BOT_TOKEN) started.")
 
     try:
         target_entity = await user_client.get_entity(TARGET_CHANNEL_ID)
         logger.info("Target channel OK: %s", getattr(target_entity, "title", TARGET_CHANNEL_ID))
     except Exception as e:
-        logger.error(
-            "Could not access TARGET_CHANNEL_ID (%s). Make sure the user "
-            "account is a member/admin there. Error: %s", TARGET_CHANNEL_ID, e,
-        )
-
-    # Auto-resume: if the bot restarted/crashed mid-copy, any channel still
-    # marked in_progress in the DB gets its copying restarted automatically
-    # (it picks up right after the last saved message id, not from scratch).
-    try:
-        all_channels = await db.get_all_channels()
-        interrupted = [c for c in all_channels if c.get("in_progress")]
-        for ch in interrupted:
-            logger.info("Resuming interrupted processing for channel %s", ch["_id"])
-            start_channel_task(ch, OWNER_ID)
-        if interrupted:
-            await bot_client.send_message(
-                OWNER_ID,
-                f"🔄 Restart ke baad {len(interrupted)} channel(s) ki copying "
-                f"automatically resume ho rahi hai.",
-            )
-    except Exception as e:
-        logger.error("Auto-resume check failed: %s", e)
+        logger.error("Target channel error: %s", e)
 
     await start_health_server()
     asyncio.create_task(self_ping_loop())
@@ -530,14 +546,11 @@ async def main():
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(lambda: asyncio.create_task(daily_revisit()), "cron", hour=0, minute=0)
     scheduler.start()
-    logger.info("Scheduler started - daily revisit at 00:00 %s", TIMEZONE)
 
-    logger.info("Bot is up and running.")
+    logger.info("Bot is running...")
     disconnected_task = asyncio.create_task(bot_client.run_until_disconnected())
     stop_task = asyncio.create_task(stop_event.wait())
-    await asyncio.wait(
-        [disconnected_task, stop_task], return_when=asyncio.FIRST_COMPLETED
-    )
+    await asyncio.wait([disconnected_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
 
 if __name__ == "__main__":
