@@ -2,19 +2,8 @@
 bot.py - Telegram multi-feature video copy & channel monitoring bot.
 
 Two Telethon clients:
-  user_client  -> logged in via SESSION_STRING (Real user account, member of target & source channels)
+  user_client  -> logged in via SESSION_STRING (Real user account)
   bot_client   -> logged in via BOT_TOKEN (Owner commands and updates)
-
-Features & Workflows:
-  1. /add_channel <message_link>
-     - Extract channel_id & start message_id.
-     - Saves channel into database for live monitoring & 24h cron scan.
-  2. /copy <message_link>
-     - Instant copying task from the given message_id up to the latest post.
-  3. Real-Time Monitor
-     - Monitors only /add_channel registered channels in real-time.
-  4. Daily 24h Scan
-     - Sequentially processes channels one-by-one starting strictly after the saved message_id.
 """
 
 import os
@@ -24,7 +13,7 @@ import logging
 import signal
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, utils, types
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -87,12 +76,6 @@ async def ensure_user_connected():
 
 
 def parse_telegram_link(link: str):
-    """
-    Parses public and private Telegram message links.
-    Examples:
-      - Private: https://t.me/c/3888815428/843  -> (-1003888815428, 843)
-      - Public:  https://t.me/channelname/843    -> ('channelname', 843)
-    """
     private_pattern = r"t\.me/c/(\d+)/(\d+)"
     public_pattern = r"t\.me/([^/]+)/(\d+)"
 
@@ -188,10 +171,6 @@ async def _copy_one(message, target_entity) -> bool:
 
 
 async def process_channel_copy(channel_id: int, start_msg_id: int, progress_chat_id: int):
-    """
-    Copies qualifying videos sequentially from start_msg_id onwards to latest message.
-    Used by /copy and daily automatic revisit scan.
-    """
     lock = get_lock(channel_id)
 
     if lock.locked():
@@ -289,11 +268,11 @@ async def process_channel_copy(channel_id: int, start_msg_id: int, progress_chat
 
 
 # ---------------------------------------------------------------------------
-# Real-Time Monitoring
+# Real-Time Monitoring (Silent Mode)
 # ---------------------------------------------------------------------------
 @user_client.on(events.NewMessage)
 async def live_channel_monitor(event):
-    """Monitors live incoming posts in registered channels."""
+    """Monitors live incoming posts in registered channels silently."""
     channel_id = event.chat_id
     if not channel_id:
         return
@@ -326,12 +305,7 @@ async def live_channel_monitor(event):
                     if file_key:
                         await db.save_file_hash(file_key, channel_id, message.id)
                     await db.update_last_message_id(channel_id, message.id)
-                    
-                    title = channel_doc.get("title", str(channel_id))
-                    await bot_client.send_message(
-                        OWNER_ID,
-                        f"⚡ **Live Video Copied!**\n📌 **Channel:** {title}\n🆔 **Msg ID:** `{message.id}`"
-                    )
+                    logger.info("Realtime: Video copied silently from %s (msg %s)", channel_id, message.id)
             except Exception as e:
                 logger.error("Live copy failed for channel %s: %s", channel_id, e)
         else:
@@ -443,7 +417,7 @@ async def copy_handler(event):
         return
 
     await event.respond(f"🚀 **Copying Started** from Msg ID `{msg_id}`...")
-    
+
     task = asyncio.create_task(process_channel_copy(channel_id, msg_id, event.chat_id))
     _running_tasks[channel_id] = task
 
